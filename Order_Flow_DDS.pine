@@ -1,0 +1,525 @@
+//@version=6
+indicator("Order Flow Absorption Monitor [Delta Divergence Scalper]", shorttitle="OF Absorption Monitor", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// =====================================================================================
+// ============================  1. INPUTS  ===========================================
+// =====================================================================================
+
+// ---- Liquidity Levels ----
+grpLiq = "Liquidity Levels"
+showPDHL      = input.bool(true, "Show Previous Day High/Low", group=grpLiq)
+pdhlStyle     = input.string("Solid", "PDH/PDL Line Style", options=["Solid", "Dashed", "Dotted"], group=grpLiq)
+pdhColor      = input.color(color.new(color.red, 0), "PDH Color", group=grpLiq, inline="pdhpdl")
+pdlColor      = input.color(color.new(color.lime, 0), "PDL Color", group=grpLiq, inline="pdhpdl")
+
+showPivots    = input.bool(true, "Show Pivot High/Low", group=grpLiq)
+pivotLeft     = input.int(5, "Pivot Left Bars", minval=1, group=grpLiq, inline="pivlen")
+pivotRight    = input.int(5, "Pivot Right Bars", minval=1, group=grpLiq, inline="pivlen")
+pivotHighColor = input.color(color.new(color.orange, 0), "Pivot High Color", group=grpLiq, inline="pivcol")
+pivotLowColor  = input.color(color.new(color.aqua, 0), "Pivot Low Color", group=grpLiq, inline="pivcol")
+
+grpDist = "Liquidity Distance"
+pipSize       = input.float(0.0001, "Pip Size (e.g. 0.0001 FX, 0.01 JPY/Indices)", minval=0.0000001, group=grpDist)
+useTicksAsPip = input.bool(false, "Use Symbol Tick Size Instead of Pip Size Above", group=grpDist)
+
+// ---- Delta / Order Flow ----
+grpDelta = "Delta / Order Flow"
+useLowerTF    = input.bool(true, "Use Lower Timeframe Aggregation for Delta (recommended)", group=grpDelta)
+lowerTFRes    = input.timeframe("1", "Lower Timeframe for Delta Aggregation", group=grpDelta)
+deltaSmaLen   = input.int(20, "Delta SMA Length", minval=2, group=grpDelta)
+spikeMult     = input.float(2.0, "Relative Delta Spike Multiplier (x SMA)", minval=1.0, step=0.1, group=grpDelta)
+exhaustionRatio = input.float(0.4, "Exhaustion Shrink Ratio (next bar delta <= X * spike delta)", minval=0.05, maxval=1.0, step=0.05, group=grpDelta)
+
+// ---- Absorption Signal Logic ----
+grpAbs = "Absorption Signal Logic"
+wickBodyRatio   = input.float(1.5, "Min Wick/Body Ratio for Rejection Candle", minval=0.5, step=0.1, group=grpAbs)
+proximityPips   = input.float(5.0, "Max Distance to Liquidity Level to Qualify (pips)", minval=0.1, group=grpAbs)
+usePDHL_Filter  = input.bool(true, "Require Price Near PDH/PDL", group=grpAbs)
+usePivot_Filter = input.bool(true, "Require Price Near Pivot High/Low", group=grpAbs)
+requireBothLevels = input.bool(false, "Require BOTH PDH/PDL AND Pivot Proximity (else EITHER)", group=grpAbs)
+
+// ---- Dashboard ----
+grpDash = "Dashboard"
+showDashboard   = input.bool(true, "Show Dashboard", group=grpDash)
+dashPosition    = input.string("top_right", "Dashboard Position", options=["top_right", "bottom_right", "bottom_left", "top_left", "middle_right", "middle_left"], group=grpDash)
+dashSize        = input.string("small", "Dashboard Size", options=["auto", "tiny", "small", "normal", "large"], group=grpDash)
+colorPreset     = input.string("Dark", "Color Preset", options=["Dark", "Light", "Custom"], group=grpDash)
+darkBg          = input.color(color.new(color.black, 10), "Dark BG", group=grpDash, inline="dark")
+darkText        = input.color(color.new(color.white, 0), "Dark Text", group=grpDash, inline="dark")
+lightBg         = input.color(color.new(color.white, 10), "Light BG", group=grpDash, inline="light")
+lightText       = input.color(color.new(color.black, 0), "Light Text", group=grpDash, inline="light")
+customBg        = input.color(color.new(color.navy, 10), "Custom BG", group=grpDash, inline="custom")
+customText      = input.color(color.new(color.yellow, 0), "Custom Text", group=grpDash, inline="custom")
+borderColor     = input.color(color.new(color.gray, 0), "Border Color", group=grpDash)
+
+showSectionGauge  = input.bool(true, "Show Section A: Delta Gauge", group=grpDash)
+showSectionFlow   = input.bool(true, "Show Section B: Order Flow Context", group=grpDash)
+showSectionMarket = input.bool(true, "Show Section C: Market Context", group=grpDash)
+showSectionTrade  = input.bool(true, "Show Section D: Trade Decision", group=grpDash)
+
+grpDashData = "Dashboard Data Settings"
+htfTimeframe    = input.timeframe("60", "HTF Bias Timeframe", group=grpDashData)
+htfEmaFastLen   = input.int(50, "HTF EMA Fast Length", minval=2, group=grpDashData)
+htfEmaSlowLen   = input.int(200, "HTF EMA Slow Length", minval=2, group=grpDashData)
+volMaLen        = input.int(20, "Volume MA Length (Surge Ratio)", minval=2, group=grpDashData)
+adrLength       = input.int(14, "ADR Lookback (Days)", minval=2, group=grpDashData)
+
+grpDashRisk = "Dashboard - Risk Calculator"
+accountSize       = input.float(1000.0, "Account Size ($)", minval=0.0, group=grpDashRisk)
+riskPercentInput  = input.float(1.0, "Risk % per Trade", minval=0.1, step=0.1, group=grpDashRisk)
+pipValuePerLot    = input.float(10.0, "Pip Value per 1.0 Lot ($)", minval=0.01, group=grpDashRisk)
+
+// ---- Sessions ----
+grpSess = "Session / Killzone Filter"
+londonSession   = input.session("0700-1600", "London Session (Exchange TZ)", group=grpSess)
+newYorkSession  = input.session("1300-2100", "New York Session (Exchange TZ)", group=grpSess)
+asiaSession     = input.session("2300-0800", "Asia Session (Exchange TZ)", group=grpSess)
+restrictToKillzone = input.bool(false, "Only Signal During London/New York Killzones", group=grpSess)
+
+// ---- Risk / Targets ----
+grpRisk = "Risk & Targets"
+slBufferPips  = input.float(3.0, "Stop Loss Buffer Beyond Extreme (pips)", minval=0.0, step=0.5, group=grpRisk)
+rr1           = input.float(2.0, "Take Profit 1 R:R", minval=0.5, step=0.5, group=grpRisk)
+rr2           = input.float(3.0, "Take Profit 2 R:R", minval=0.5, step=0.5, group=grpRisk)
+tp2UsesOpposite = input.bool(true, "TP2 Uses Opposite PDH/PDL Instead of R:R (if closer/valid)", group=grpRisk)
+
+// ---- Alerts ----
+grpAlert = "Alerts"
+alertOnAbsorption   = input.bool(true, "Enable Absorption Triggered Alerts", group=grpAlert)
+alertOnWarning      = input.bool(true, "Enable Potential Absorption Warning Alerts", group=grpAlert)
+
+// =====================================================================================
+// ============================  2. PIP / DISTANCE HELPERS  ===========================
+// =====================================================================================
+
+pipUnit = useTicksAsPip ? syminfo.mintick : pipSize
+
+toPips(priceDist) =>
+    priceDist / pipUnit
+
+// =====================================================================================
+// ============================  3. LIQUIDITY LEVELS  ==================================
+// =====================================================================================
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+var line pdhLine = na
+var line pdlLine = na
+
+pdhlLineStyle = pdhlStyle == "Solid" ? line.style_solid : pdhlStyle == "Dashed" ? line.style_dashed : line.style_dotted
+
+if showPDHL and barstate.isconfirmed
+    line.delete(pdhLine)
+    line.delete(pdlLine)
+    pdhLine := line.new(bar_index - 200, pdh, bar_index + 20, pdh, extend=extend.right, color=pdhColor, style=pdhlLineStyle, width=1)
+    pdlLine := line.new(bar_index - 200, pdl, bar_index + 20, pdl, extend=extend.right, color=pdlColor, style=pdhlLineStyle, width=1)
+
+pivHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+pivLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float lastPivotHigh = na
+var float lastPivotLow  = na
+
+if not na(pivHigh)
+    lastPivotHigh := pivHigh
+    if showPivots
+        label.new(bar_index - pivotRight, pivHigh, "PH", style=label.style_label_down, color=pivotHighColor, textcolor=color.white, size=size.tiny)
+
+if not na(pivLow)
+    lastPivotLow := pivLow
+    if showPivots
+        label.new(bar_index - pivotRight, pivLow, "PL", style=label.style_label_up, color=pivotLowColor, textcolor=color.white, size=size.tiny)
+
+distToPDH = toPips(math.abs(close - pdh))
+distToPDL = toPips(math.abs(close - pdl))
+distToPivHigh = na(lastPivotHigh) ? na : toPips(math.abs(close - lastPivotHigh))
+distToPivLow  = na(lastPivotLow)  ? na : toPips(math.abs(close - lastPivotLow))
+
+nearPDL = distToPDL <= proximityPips
+nearPDH = distToPDH <= proximityPips
+nearPivLow  = not na(distToPivLow)  and distToPivLow  <= proximityPips
+nearPivHigh = not na(distToPivHigh) and distToPivHigh <= proximityPips
+
+nearSupport = requireBothLevels ? (nearPDL and nearPivLow) : ((usePDHL_Filter and nearPDL) or (usePivot_Filter and nearPivLow) or (not usePDHL_Filter and not usePivot_Filter))
+nearResistance = requireBothLevels ? (nearPDH and nearPivHigh) : ((usePDHL_Filter and nearPDH) or (usePivot_Filter and nearPivHigh) or (not usePDHL_Filter and not usePivot_Filter))
+
+// =====================================================================================
+// ============================  4. DELTA CALCULATION  =================================
+// =====================================================================================
+
+upVolLTF(idx) =>
+    v = volume
+    o = open
+    c = close
+    c > o ? v : c < o ? 0.0 : v * 0.5
+
+downVolLTF(idx) =>
+    v = volume
+    o = open
+    c = close
+    c < o ? v : c > o ? 0.0 : v * 0.5
+
+[upVolArr, downVolArr] = request.security_lower_tf(syminfo.tickerid, lowerTFRes, [upVolLTF(0), downVolLTF(0)])
+
+upVolLTFSum = array.sum(upVolArr)
+downVolLTFSum = array.sum(downVolArr)
+
+upVolApprox = close > open ? volume : close < open ? 0.0 : volume * 0.5
+downVolApprox = close < open ? volume : close > open ? 0.0 : volume * 0.5
+
+volUp = useLowerTF and array.size(upVolArr) > 0 ? upVolLTFSum : upVolApprox
+volDown = useLowerTF and array.size(downVolArr) > 0 ? downVolLTFSum : downVolApprox
+
+barDelta = volUp - volDown
+deltaSma = ta.sma(barDelta, deltaSmaLen)
+
+var float cvd = 0.0
+cvd := cvd + barDelta
+
+cvdBullish = cvd > cvd[5]
+cvdBearish = cvd < cvd[5]
+
+absDeltaSma = math.abs(deltaSma)
+isSpike = absDeltaSma > 0 and math.abs(barDelta) >= spikeMult * absDeltaSma
+isNegativeSpike = isSpike and barDelta < 0
+isPositiveSpike = isSpike and barDelta > 0
+
+// =====================================================================================
+// ============================  5. CANDLE STRUCTURE  ==================================
+// =====================================================================================
+
+bodySize  = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+safeBody  = bodySize == 0 ? syminfo.mintick : bodySize
+
+isLongLowerWick = lowerWick >= wickBodyRatio * safeBody
+isLongUpperWick = upperWick >= wickBodyRatio * safeBody
+
+// =====================================================================================
+// ============================  6. ABSORPTION LOGIC (NON-REPAINTING)  =================
+// =====================================================================================
+
+bullAbsorptionCandidate = barstate.isconfirmed and nearSupport and isNegativeSpike and isLongLowerWick
+bearAbsorptionCandidate = barstate.isconfirmed and nearResistance and isPositiveSpike and isLongUpperWick
+
+var bool waitingBullConfirm = false
+var bool waitingBearConfirm = false
+var float bullCandidateDelta = na
+var float bearCandidateDelta = na
+var float bullCandidateLow   = na
+var float bearCandidateHigh  = na
+
+bullAbsorptionConfirmed = false
+bearAbsorptionConfirmed = false
+
+if barstate.isconfirmed
+    if bullAbsorptionCandidate
+        waitingBullConfirm := true
+        bullCandidateDelta := barDelta
+        bullCandidateLow   := low
+    else if waitingBullConfirm
+        shrunk = math.abs(barDelta) <= exhaustionRatio * math.abs(bullCandidateDelta)
+        flipped = barDelta > 0
+        if shrunk or flipped
+            bullAbsorptionConfirmed := true
+        waitingBullConfirm := false
+
+    if bearAbsorptionCandidate
+        waitingBearConfirm := true
+        bearCandidateDelta := barDelta
+        bearCandidateHigh  := high
+    else if waitingBearConfirm
+        shrunk = math.abs(barDelta) <= exhaustionRatio * math.abs(bearCandidateDelta)
+        flipped = barDelta < 0
+        if shrunk or flipped
+            bearAbsorptionConfirmed := true
+        waitingBearConfirm := false
+
+// =====================================================================================
+// ============================  7. SESSION / KILLZONE  ================================
+// =====================================================================================
+
+inLondon  = not na(time(timeframe.period, londonSession))
+inNewYork = not na(time(timeframe.period, newYorkSession))
+inAsia    = not na(time(timeframe.period, asiaSession))
+
+killzoneActive = inLondon or inNewYork
+allowSignal = restrictToKillzone ? killzoneActive : true
+
+finalBullSignal = bullAbsorptionConfirmed and allowSignal
+finalBearSignal = bearAbsorptionConfirmed and allowSignal
+
+// =====================================================================================
+// ============================  8. ENTRY / SL / TP CALCULATION  =======================
+// =====================================================================================
+
+var float entryPrice = na
+var float slPrice = na
+var float tp1Price = na
+var float tp2Price = na
+var string actionState = "NEUTRAL"
+
+slBufferPrice = slBufferPips * pipUnit
+
+if finalBullSignal
+    entryPrice  := close
+    slPrice     := bullCandidateLow - slBufferPrice
+    riskDist    = entryPrice - slPrice
+    tp1Price    := entryPrice + riskDist * rr1
+    tp2Calc     = entryPrice + riskDist * rr2
+    tp2Price    := tp2UsesOpposite and pdh > entryPrice ? pdh : tp2Calc
+    actionState := "READY BUY"
+
+if finalBearSignal
+    entryPrice  := close
+    slPrice     := bearCandidateHigh + slBufferPrice
+    riskDist    = slPrice - entryPrice
+    tp1Price    := entryPrice - riskDist * rr1
+    tp2Calc     = entryPrice - riskDist * rr2
+    tp2Price    := tp2UsesOpposite and pdl < entryPrice ? pdl : tp2Calc
+    actionState := "READY SELL"
+
+// RESET VARIABLE SAAT NEUTRAL (Menghapus harga lama dari dashboard)
+if actionState == "READY BUY" and (low <= slPrice or high >= tp2Price)
+    actionState := "NEUTRAL"
+    entryPrice  := na
+    slPrice     := na
+    tp1Price    := na
+    tp2Price    := na
+
+if actionState == "READY SELL" and (high >= slPrice or low <= tp2Price)
+    actionState := "NEUTRAL"
+    entryPrice  := na
+    slPrice     := na
+    tp1Price    := na
+    tp2Price    := na
+
+// =====================================================================================
+// ============================  9. PLOTTING  ===========================================
+// =====================================================================================
+
+plotshape(finalBullSignal, title="Bullish Absorption", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="ABS")
+plotshape(finalBearSignal, title="Bearish Absorption", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="ABS")
+
+plotshape(bullAbsorptionCandidate, title="Bull Absorption Warning", style=shape.circle, location=location.belowbar, color=color.new(color.yellow, 40), size=size.tiny)
+plotshape(bearAbsorptionCandidate, title="Bear Absorption Warning", style=shape.circle, location=location.abovebar, color=color.new(color.yellow, 40), size=size.tiny)
+
+var line slLine = na
+var line tp1Line = na
+var line tp2Line = na
+var line entryLine = na
+
+if finalBullSignal or finalBearSignal
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(entryLine)
+    entryLine := line.new(bar_index, entryPrice, bar_index + 30, entryPrice, color=color.new(color.blue, 0), style=line.style_solid, width=1)
+    slLine    := line.new(bar_index, slPrice, bar_index + 30, slPrice, color=color.new(color.red, 0), style=line.style_dashed, width=1)
+    tp1Line   := line.new(bar_index, tp1Price, bar_index + 30, tp1Price, color=color.new(color.green, 0), style=line.style_dotted, width=1)
+    tp2Line   := line.new(bar_index, tp2Price, bar_index + 30, tp2Price, color=color.new(color.green, 0), style=line.style_solid, width=1)
+else if actionState == "NEUTRAL"
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(entryLine)
+
+// =====================================================================================
+// ============================  9B. DASHBOARD SUPPORT CALCULATIONS  ===================
+// =====================================================================================
+
+totalVol = volUp + volDown
+buyPct   = totalVol > 0 ? volUp / totalVol * 100 : 50.0
+sellPct  = 100 - buyPct
+deltaBalance = totalVol > 0 ? (volUp - volDown) / totalVol : 0.0
+
+// RENDERING GAUGE DENGAN KARAKTER BLOK SOLID ORIGINAL (█ DAN ░)
+gaugeBlocksPerSide = 5
+filledRight = math.round(math.max(deltaBalance, 0.0) * gaugeBlocksPerSide)
+filledLeft  = math.round(math.max(-deltaBalance, 0.0) * gaugeBlocksPerSide)
+
+gaugeLeftStr  = str.repeat("░", gaugeBlocksPerSide - int(filledLeft)) + str.repeat("█", int(filledLeft))
+gaugeRightStr = str.repeat("█", int(filledRight)) + str.repeat("░", gaugeBlocksPerSide - int(filledRight))
+gaugeStr      = "[" + gaugeLeftStr + "|" + gaugeRightStr + "]"
+
+relVolStatus  = isSpike ? "🔴 SPIKE" : math.abs(barDelta) >= 1.2 * absDeltaSma ? "🟡 Elevated" : "🟢 Normal"
+
+volMa = ta.sma(volume, volMaLen)
+volSurgeRatio = volMa > 0 ? volume / volMa * 100 : na
+
+absorptionStateText = waitingBullConfirm ? "🔥 BULL ABSORPTION" : waitingBearConfirm ? "⚡ BEAR ABSORPTION" : "NORMAL"
+absorptionStateColor = waitingBullConfirm ? color.new(color.lime, 60) : waitingBearConfirm ? color.new(color.red, 60) : color.new(color.gray, 80)
+
+sessionEmojiLabel = inLondon and inNewYork ? "🌍 LONDON/NY OVERLAP" : inLondon ? "🇬🇧 LONDON" : inNewYork ? "🇺🇸 NEW YORK" : inAsia ? "🌏 ASIA" : "💤 OFF-HOURS"
+
+htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaFastLen), lookahead=barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaSlowLen), lookahead=barmerge.lookahead_off)
+htfBiasText = htfEmaFast > htfEmaSlow ? "BULLISH ▲" : htfEmaFast < htfEmaSlow ? "BEARISH ▼" : "FLAT"
+
+nearestDistVal = math.min(distToPDH, distToPDL)
+nearestLevel   = distToPDL < distToPDH ? "PDL" : "PDH"
+if not na(distToPivHigh) and distToPivHigh < nearestDistVal
+    nearestDistVal := distToPivHigh
+    nearestLevel   := "Pivot High"
+if not na(distToPivLow) and distToPivLow < nearestDistVal
+    nearestDistVal := distToPivLow
+    nearestLevel   := "Pivot Low"
+
+adrDailyRange = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrLength)[1], lookahead=barmerge.lookahead_off)
+todayHighD = request.security(syminfo.tickerid, "D", high, lookahead=barmerge.lookahead_off)
+todayLowD  = request.security(syminfo.tickerid, "D", low,  lookahead=barmerge.lookahead_off)
+todayRangeUsed = todayHighD - todayLowD
+adrUsedPct = adrDailyRange > 0 ? todayRangeUsed / adrDailyRange * 100 : na
+
+slPipsCalc = (na(entryPrice) or na(slPrice)) ? na : toPips(math.abs(entryPrice - slPrice))
+riskAmount = accountSize * riskPercentInput / 100
+recommendedLot = (not na(slPipsCalc) and slPipsCalc > 0 and pipValuePerLot > 0) ? riskAmount / (slPipsCalc * pipValuePerLot) : na
+
+// =====================================================================================
+// ============================  10. DASHBOARD TABLE  ===================================
+// =====================================================================================
+
+getPosition(pos) =>
+    switch pos
+        "top_right" => position.top_right
+        "bottom_right" => position.bottom_right
+        "bottom_left" => position.bottom_left
+        "top_left" => position.top_left
+        "middle_right" => position.middle_right
+        "middle_left" => position.middle_left
+        => position.top_right
+
+getSize(sz) =>
+    switch sz
+        "auto" => size.auto
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        "large" => size.large
+        => size.small
+
+bgCol   = colorPreset == "Dark" ? darkBg : colorPreset == "Light" ? lightBg : customBg
+textCol = colorPreset == "Dark" ? darkText : colorPreset == "Light" ? lightText : customText
+sectionHeadBg = color.new(bgCol, 0)
+
+var table dash = table.new(getPosition(dashPosition), 2, 32, border_width=1, border_color=borderColor)
+
+fmtPips(v) => na(v) ? "-" : str.tostring(v, "#.#") + " pips"
+fmtPrice(v) => na(v) ? "-" : str.tostring(v, format.mintick)
+fmtPct(v) => na(v) ? "-" : str.tostring(v, "#.#") + "%"
+
+if showDashboard and barstate.islast
+    rowIdx = 0
+
+    table.cell(dash, 0, rowIdx, "⚙ ORDER FLOW ABSORPTION MONITOR", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+    table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+    rowIdx := rowIdx + 1
+
+    // SECTION A: LIVE DELTA GAUGE
+    if showSectionGauge
+        table.cell(dash, 0, rowIdx, "── A: DELTA GAUGE (LIVE) ──", text_color=textCol, bgcolor=sectionHeadBg, text_size=getSize(dashSize))
+        table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "SELL " + fmtPct(sellPct) + "  " + gaugeStr + "  " + fmtPct(buyPct) + " BUY", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Delta / Rel. Vol", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, str.tostring(barDelta, format.volume) + "  " + relVolStatus, text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+    // SECTION B: ORDER FLOW CONTEXT
+    if showSectionFlow
+        table.cell(dash, 0, rowIdx, "── B: ORDER FLOW CONTEXT ──", text_color=textCol, bgcolor=sectionHeadBg, text_size=getSize(dashSize))
+        table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+        rowIdx := rowIdx + 1
+
+        cvdDir = cvdBullish ? "Bullish ▲ (Accumulating)" : cvdBearish ? "Bearish ▼ (Distributing)" : "Flat"
+        table.cell(dash, 0, rowIdx, "CVD Trend", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, cvdDir, text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Volume Surge", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPct(volSurgeRatio) + " of Avg Vol", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Absorption State", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, absorptionStateText, text_color=textCol, bgcolor=absorptionStateColor, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+    // SECTION C: MARKET CONTEXT
+    if showSectionMarket
+        table.cell(dash, 0, rowIdx, "── C: MARKET CONTEXT ──", text_color=textCol, bgcolor=sectionHeadBg, text_size=getSize(dashSize))
+        table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Session", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, sessionEmojiLabel, text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "HTF Bias (" + htfTimeframe + ")", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, htfBiasText, text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Liquidity Proximity", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, nearestLevel + ": " + fmtPips(nearestDistVal), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "ADR Used", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPct(adrUsedPct), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+    // SECTION D: TRADE DECISION
+    if showSectionTrade
+        table.cell(dash, 0, rowIdx, "── D: TRADE DECISION ──", text_color=textCol, bgcolor=sectionHeadBg, text_size=getSize(dashSize))
+        table.merge_cells(dash, 0, rowIdx, 1, rowIdx)
+        rowIdx := rowIdx + 1
+
+        actionColor = actionState == "READY BUY" ? color.new(color.lime, 0) : actionState == "READY SELL" ? color.new(color.red, 0) : bgCol
+        table.cell(dash, 0, rowIdx, "Action Status", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, actionState, text_color=textCol, bgcolor=actionColor, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Entry Price", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPrice(entryPrice), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Stop Loss", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPrice(slPrice) + " (" + fmtPips(slPipsCalc) + ")", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "TP1 (1:" + str.tostring(rr1) + ")", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPrice(tp1Price), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "TP2 (1:" + str.tostring(rr2) + ")", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, fmtPrice(tp2Price), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Risk $ (" + str.tostring(riskPercentInput) + "%)", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, "$" + str.tostring(riskAmount, "#.##"), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+        table.cell(dash, 0, rowIdx, "Recommended Lot", text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        table.cell(dash, 1, rowIdx, na(recommendedLot) ? "-" : str.tostring(recommendedLot, "#.##"), text_color=textCol, bgcolor=bgCol, text_size=getSize(dashSize))
+        rowIdx := rowIdx + 1
+
+// =====================================================================================
+// ============================  11. ALERTS  ============================================
+// =====================================================================================
+
+alertcondition(finalBullSignal, title="Bullish Absorption Triggered", message="Bullish Passive Absorption confirmed at key liquidity level. Consider LONG entry.")
+alertcondition(finalBearSignal, title="Bearish Absorption Triggered", message="Bearish Passive Absorption confirmed at key liquidity level. Consider SHORT entry.")
+alertcondition(bullAbsorptionCandidate or bearAbsorptionCandidate, title="Potential Absorption Warning", message="Potential absorption forming — awaiting next-bar confirmation.")
+
+if alertOnAbsorption and finalBullSignal
+    alert("Bullish Absorption Triggered: Entry " + str.tostring(entryPrice, format.mintick) + " SL " + str.tostring(slPrice, format.mintick) + " TP1 " + str.tostring(tp1Price, format.mintick) + " TP2 " + str.tostring(tp2Price, format.mintick), alert.freq_once_per_bar_close)
+
+if alertOnAbsorption and finalBearSignal
+    alert("Bearish Absorption Triggered: Entry " + str.tostring(entryPrice, format.mintick) + " SL " + str.tostring(slPrice, format.mintick) + " TP1 " + str.tostring(tp1Price, format.mintick) + " TP2 " + str.tostring(tp2Price, format.mintick), alert.freq_once_per_bar_close)
+
+if alertOnWarning and (bullAbsorptionCandidate or bearAbsorptionCandidate)
+    alert("Potential Absorption Warning: delta spike + rejection wick detected near liquidity level, awaiting confirmation.", alert.freq_once_per_bar_close)
